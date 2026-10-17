@@ -38,6 +38,7 @@ import org.polypheny.db.catalog.logistic.ConstraintType;
 import org.polypheny.db.catalog.logistic.DataModel;
 import org.polypheny.db.catalog.logistic.ForeignKeyOption;
 import org.polypheny.db.catalog.logistic.PlacementType;
+import org.polypheny.db.catalog.mapping.MappingState;
 import org.polypheny.db.languages.QueryLanguage;
 import org.polypheny.db.nodes.DataTypeSpec;
 import org.polypheny.db.nodes.Identifier;
@@ -417,6 +418,9 @@ public abstract class DdlManager {
      * @param statement the used statement
      */
     public abstract void renameTable( LogicalTable table, String newTableName, Statement statement );
+
+    /** Applies a names-only mapping edit and commits the owning transaction once. */
+    public abstract MappingState updateMapping( MappingUpdate update, Statement statement );
 
     public abstract void renameCollection( LogicalCollection collection, String newName, Statement statement );
 

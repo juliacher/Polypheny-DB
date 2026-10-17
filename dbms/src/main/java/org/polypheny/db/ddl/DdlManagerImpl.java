@@ -83,6 +83,11 @@ import org.polypheny.db.catalog.entity.logical.LogicalPrimaryKey;
 import org.polypheny.db.catalog.entity.logical.LogicalTable;
 import org.polypheny.db.catalog.entity.logical.LogicalTableWrapper;
 import org.polypheny.db.catalog.entity.logical.LogicalView;
+import org.polypheny.db.catalog.entity.mapping.SchemaMapping;
+import org.polypheny.db.catalog.entity.mapping.SchemaMappingManager;
+import org.polypheny.db.catalog.entity.mapping.rules.DirectColumnMappingRule;
+import org.polypheny.db.catalog.entity.mapping.rules.MappingRule;
+import org.polypheny.db.catalog.mapping.MappingState;
 import org.polypheny.db.catalog.exceptions.GenericRuntimeException;
 import org.polypheny.db.catalog.logistic.Collation;
 import org.polypheny.db.catalog.logistic.ConstraintType;
@@ -255,7 +260,9 @@ public class DdlManagerImpl extends DdlManager {
         }
     }
 
-
+    /*
+    Creates the logical table and columns, partition, placement, and allocation records.
+     */
     private void createRelationalSource( Transaction transaction, DataSource<?> adapter, long namespace ) {
         Map<String, List<ExportedColumn>> exportedColumns;
         try {
@@ -318,10 +325,14 @@ public class DdlManagerImpl extends DdlManager {
 
             buildRelationalNamespace( namespace, logical, adapter );
 
-            transaction.attachCommitAction( () ->
-                    // we can execute with initial logical and allocation data as this is a source and this will not change
-                    adapter.createTable( null, LogicalTableWrapper.of( logical, columns, List.of() ), AllocationTableWrapper.of( allocation.unwrapOrThrow( AllocationTable.class ), aColumns, physicalSchema ) )
-            );
+            transaction.attachCommitAction( () -> {
+                // we can execute with initial logical and allocation data as this is a source and this will not change
+                adapter.createTable( null, LogicalTableWrapper.of( logical, columns, List.of() ), AllocationTableWrapper.of( allocation.unwrapOrThrow( AllocationTable.class ), aColumns, physicalSchema ) );
+                // Create Mappings
+                // Mapping validation resolves the physical columns registered by createTable.
+                SchemaMapping mapping = SchemaMappingManager.createDefaultMapping( logical.id, logical.dataModel, columns.stream().map( column -> column.id ).toList() );
+                catalog.addSchemaMapping( mapping );
+            } );
             catalog.updateSnapshot();
         }
     }
@@ -371,6 +382,10 @@ public class DdlManagerImpl extends DdlManager {
                     if ( table.entityType != EntityType.SOURCE ) {
                         throw new GenericRuntimeException( "Trying to drop a table located on a data source which is not of table type SOURCE. This should not happen!" );
                     }
+
+                    // When dropping a source adapter or a table, it removes that table’s mapping before deleting its allocation columns.
+                    catalog.removeSchemaMappingsForEntity( table.id );
+
                     // Delete column placement in catalog
                     for ( AllocationColumn column : allocation.unwrap( AllocationTable.class ).get().getColumns() ) {
                         catalog.getAllocRel( allocation.namespaceId ).deleteColumn( allocation.id, column.columnId );
@@ -1729,6 +1744,59 @@ public class DdlManagerImpl extends DdlManager {
 
 
     @Override
+    public MappingState updateMapping( MappingUpdate update, Statement statement ) {
+        statement.getQueryProcessor().lock( statement );
+        synchronized ( catalog ) {
+            MappingState state = MappingState.load( catalog, update.adapterId(), update.mappingId() );
+            MappingUpdate validated = state.validate( update, catalog.getSnapshot() );
+            Adapter<?> adapter = AdapterManager.getInstance().getAdapter( update.adapterId() ).orElseThrow( MappingState::notFound );
+            try {
+                catalog.runCatalogUpdate( () -> {
+                    var relational = catalog.getLogicalRel( state.namespace().id );
+                    // Preflight above checks final names and dependencies against one protected snapshot.
+                    if ( !state.table().name.equals( validated.logicalTableName() ) ) {
+                        relational.renameTable( state.table().id, validated.logicalTableName() );
+                    }
+                    for ( var column : validated.columns() ) {
+                        String oldName = state.columns().stream().filter( c -> c.id == column.logicalColumnId() ).findFirst().orElseThrow().name;
+                        if ( !oldName.equals( column.logicalName() ) ) {
+                            relational.renameColumn( column.logicalColumnId(), column.logicalName() );
+                            adapter.renameLogicalColumn( column.logicalColumnId(), column.logicalName() );
+                        }
+                    }
+                    SchemaMapping mapping = SchemaMappingManager.renameMapping( state.mapping(), validated.mappingName() );
+                    Set<Long> included = validated.columns().stream().filter( MappingUpdate.ColumnName::included )
+                            .map( MappingUpdate.ColumnName::logicalColumnId ).collect( Collectors.toSet() );
+                    List<MappingRule> rules = new ArrayList<>( mapping.rules().stream()
+                            .filter( rule -> included.contains( ((DirectColumnMappingRule) rule).targetLogicalColumnId() ) ).toList() );
+                    validated.columns().stream().filter( column -> column.included() && !state.isIncluded( column.logicalColumnId() ) )
+                            .map( column -> new DirectColumnMappingRule( column.logicalColumnId() ) ).forEach( rules::add );
+                    mapping = new SchemaMapping( mapping.id(), mapping.name(), mapping.kind(), mapping.sourceEntityId(), mapping.targetEntityId(),
+                            mapping.sourceModel(), mapping.targetModel(), rules );
+                    catalog.updateSchemaMapping( mapping );
+                    statement.getQueryProcessor().resetCaches();
+                    try {
+                        statement.getTransaction().commit();
+                    } catch ( Exception e ) {
+                        // Rollback while the catalog update still owns exclusive schema protection.
+                        try {
+                            statement.getTransaction().rollback( "Mapping update failed" );
+                        } catch ( Exception rollbackError ) {
+                            e.addSuppressed( rollbackError );
+                        }
+                        throw new GenericRuntimeException( "Could not commit the mapping update.", e );
+                    }
+                } );
+            } catch ( RuntimeException e ) {
+                statement.getQueryProcessor().resetCaches();
+                throw e;
+            }
+            return MappingState.load( catalog, update.adapterId(), update.mappingId() );
+        }
+    }
+
+
+    @Override
     public void renameCollection( LogicalCollection collection, String newName, Statement statement ) {
         if ( catalog.getSnapshot().rel().getTable( collection.namespaceId, newName ).isPresent() ) {
             throw new GenericRuntimeException( "An entity with name %s already exists", newName );
@@ -3045,6 +3113,8 @@ public class DdlManagerImpl extends DdlManager {
     @Override
     public void dropTable( LogicalTable table, Statement statement ) {
         // todo Make sure that all adapters are of type storeId (and not source)
+        catalog.removeSchemaMappingsForEntity( table.id );
+        // Removing a source mapping exposes its retained columns and keys for complete cleanup.
         Snapshot snapshot = catalog.getSnapshot();
 
         // delete all allocations and physicals

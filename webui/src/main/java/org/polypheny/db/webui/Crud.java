@@ -161,6 +161,7 @@ import org.polypheny.db.util.Pair;
 import org.polypheny.db.util.PolyphenyHomeDirManager;
 import org.polypheny.db.webui.auth.AuthCrud;
 import org.polypheny.db.webui.crud.CatalogCrud;
+import org.polypheny.db.webui.crud.MappingCrud;
 import org.polypheny.db.webui.crud.LanguageCrud;
 import org.polypheny.db.webui.crud.LanguageCrud.TriFunction;
 import org.polypheny.db.webui.crud.StatisticCrud;
@@ -218,6 +219,7 @@ public class Crud implements InformationObserver, PropertyChangeListener {
     public final StatisticCrud statisticCrud;
 
     public final CatalogCrud catalogCrud;
+    public final MappingCrud mappingCrud;
     public final AuthCrud authCrud;
 
 
@@ -231,6 +233,7 @@ public class Crud implements InformationObserver, PropertyChangeListener {
         this.languageCrud = new LanguageCrud( this );
         this.statisticCrud = new StatisticCrud( this );
         this.catalogCrud = new CatalogCrud( this );
+        this.mappingCrud = new MappingCrud( this );
         this.authCrud = new AuthCrud( this );
 
         Catalog.afterInit( () -> Catalog.getInstance().addObserver( this ) );
